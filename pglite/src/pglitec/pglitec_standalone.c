@@ -22,7 +22,9 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <netdb.h>
+#include <stdio.h>
 #include <netinet/in.h>
 #include <setjmp.h>
 #include <stdlib.h>
@@ -129,6 +131,118 @@ int EMSCRIPTEN_KEEPALIVE pgl_fs_write_file(const char *path, const void *buf, si
         len -= n;
     }
     close(fd);
+    return 0;
+}
+
+/* like mkdir -p, for the parent directories of path */
+static int pgl_fs_mkdir_parents(char *path) {
+    for (char *p = path + 1; *p; p++) {
+        if (*p != '/')
+            continue;
+        *p = '\0';
+        int rc = pgl_fs_mkdir(path, 0700);
+        *p = '/';
+        if (rc != 0)
+            return rc;
+    }
+    return 0;
+}
+
+static size_t pgl_tar_octal(const char *field, size_t len) {
+    size_t value = 0;
+    for (size_t i = 0; i < len && field[i]; i++) {
+        if (field[i] >= '0' && field[i] <= '7')
+            value = value * 8 + (field[i] - '0');
+    }
+    return value;
+}
+
+/*
+* Unpack an (uncompressed) tarball into the filesystem under prefix, creating
+* parent directories as needed. Supports regular files and directories, with
+* ustar name prefixes, GNU long names and pax path records. Doing this inside
+* the module saves the host a call per file.
+* Returns 0 on success and -errno on failure.
+*/
+int EMSCRIPTEN_KEEPALIVE pgl_fs_load_tar(const char *prefix, const char *tar, size_t len) {
+    char path[PATH_MAX];
+    char long_name[PATH_MAX] = "";
+    size_t offset = 0;
+
+    while (offset + 512 <= len) {
+        const char *header = tar + offset;
+        const char *data = header + 512;
+        char name[256];
+        size_t size;
+        char type;
+        int mode;
+        int rc;
+
+        if (header[0] == '\0')
+            break;          /* end of archive */
+        size = pgl_tar_octal(header + 124, 12);
+        type = header[156] ? header[156] : '0';
+        mode = (int) pgl_tar_octal(header + 100, 8) & 0777;
+        if (offset + 512 + size > len)
+            return -EINVAL;
+        offset += 512 + (size + 511) / 512 * 512;
+
+        if (type == 'L') {              /* GNU long name for the next entry */
+            snprintf(long_name, sizeof(long_name), "%.*s", (int) size, data);
+            continue;
+        }
+        if (type == 'x') {              /* pax extended header */
+            const char *rec = data;
+            while (rec < data + size) {
+                size_t rec_len = strtoul(rec, NULL, 10);
+                const char *kv = memchr(rec, ' ', size - (rec - data));
+                if (rec_len == 0 || kv == NULL)
+                    break;
+                if (strncmp(kv + 1, "path=", 5) == 0)
+                    snprintf(long_name, sizeof(long_name), "%.*s",
+                             (int) (rec + rec_len - (kv + 6) - 1), kv + 6);
+                rec += rec_len;
+            }
+            continue;
+        }
+        if (type == 'g')                /* pax global header */
+            continue;
+
+        if (long_name[0]) {
+            snprintf(name, sizeof(name), "%s", long_name);
+            long_name[0] = '\0';
+        } else if (memcmp(header + 257, "ustar", 5) == 0 && header[345]) {
+            snprintf(name, sizeof(name), "%.155s/%.100s", header + 345, header);
+        } else {
+            snprintf(name, sizeof(name), "%.100s", header);
+        }
+
+        /* strip leading "./" and "/", and trailing "/" */
+        const char *rel = name;
+        while (rel[0] == '/' || (rel[0] == '.' && rel[1] == '/'))
+            rel += rel[0] == '/' ? 1 : 2;
+        size_t rel_len = strlen(rel);
+        while (rel_len > 0 && rel[rel_len - 1] == '/')
+            rel_len--;
+        if (rel_len == 0 || (rel_len == 1 && rel[0] == '.'))
+            continue;
+        if (snprintf(path, sizeof(path), "%s/%.*s",
+                     strcmp(prefix, "/") == 0 ? "" : prefix, (int) rel_len, rel) >= (int) sizeof(path))
+            return -ENAMETOOLONG;
+
+        rc = pgl_fs_mkdir_parents(path);
+        if (rc != 0)
+            return rc;
+        if (type == '5') {
+            rc = pgl_fs_mkdir(path, mode ? mode : 0700);
+        } else if (type == '0' || type == '7') {
+            rc = pgl_fs_write_file(path, data, size, mode ? mode : 0600);
+        } else {
+            return -ENOTSUP;
+        }
+        if (rc != 0)
+            return rc;
+    }
     return 0;
 }
 

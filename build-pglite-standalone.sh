@@ -119,8 +119,9 @@ STANDALONE_LDFLAGS="\
 
 # the pglitec objects are linked in through LDFLAGS_EX; they are not make prerequisites, so always relink
 rm -f src/backend/pglite.wasm
+# LDFLAGS_EX_BE (--export-dynamic) would export every symbol, which only dynamically loaded extensions need
 POSTGRES_PGLITE_FLAGS="$PGLITE_CFLAGS $STANDALONE_LDFLAGS" \
-    emmake make PORTNAME=emscripten -C src/backend/ pglite X=.wasm || { echo 'error: emmake make PORTNAME=emscripten -C src/backend/ pglite' ; exit 31; }
+    emmake make PORTNAME=emscripten -C src/backend/ pglite X=.wasm LDFLAGS_EX_BE= || { echo 'error: emmake make PORTNAME=emscripten -C src/backend/ pglite' ; exit 31; }
 
 # Step 4: the runtime filesystem (share/ data, ICU, static files), which the
 # host unpacks into the module's in-memory filesystem before startup
