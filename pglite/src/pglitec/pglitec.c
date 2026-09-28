@@ -36,6 +36,18 @@
 volatile int is_pglite_active = 0;
 volatile int pglite_exit_status = -1;
 
+/*
+* Abandon the current C stack and return control to the host, keeping the
+* instance alive. The standalone build provides its own (pglitec_standalone.c).
+*/
+#if !defined(PGLITE_STANDALONE)
+void pgl_unwind_to_host(void) {
+    emscripten_exit_with_live_runtime();
+}
+#else
+extern void pgl_unwind_to_host(void);
+#endif
+
 void EMSCRIPTEN_KEEPALIVE clear_setitimer(void) {
     struct itimerval zero = {{0, 0}, {0, 0}};
     setitimer(ITIMER_REAL, &zero, NULL);
@@ -85,7 +97,7 @@ void EMSCRIPTEN_KEEPALIVE pgl_longjmp(jmp_buf env, int val) {
         if (!ignore_till_sync)
 		    send_ready_for_query = true;	/* initially, or after error */
         pglite_exit_status = POSTGRES_MAIN_LONGJMP;
-        emscripten_exit_with_live_runtime();
+        pgl_unwind_to_host();
     }
     longjmp(env, val);
 }

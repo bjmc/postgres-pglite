@@ -3,13 +3,17 @@
 DOCKER_WORKSPACE=$(pwd)
 echo "PGLITE_VERSION=${PGLITE_VERSION}"
 echo "DEBUG=${DEBUG}"
+# ./build-pglite.sh (default) or ./build-pglite-standalone.sh
+BUILD_SCRIPT=${BUILD_SCRIPT:-./build-pglite.sh}
+# docker (default) or podman
+CONTAINER_RUNNER=${CONTAINER_RUNNER:-docker}
 
-docker run $@ \
+${CONTAINER_RUNNER} run $@ \
   --rm \
   -e DEBUG=${DEBUG:-false} \
   -e PGLITE_VERSION=${PGLITE_VERSION} \
   --workdir=${DOCKER_WORKSPACE} \
   -v .:${DOCKER_WORKSPACE}:rw \
   -v ./dist:/pglite:rw \
-  electricsql/pglite-builder:3.1.74-7 \
-  ./build-pglite.sh
+  docker.io/electricsql/pglite-builder:3.1.74-7 \
+  ${BUILD_SCRIPT}

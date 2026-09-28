@@ -214,6 +214,7 @@ extern sigjmp_buf postgresmain_sigjmp_buf;
 extern int pgl_sigsetjmp(sigjmp_buf env, int savesigs);
 extern int is_pglite_active;
 extern int pgl_setPGliteExitStatus(int status);
+extern void pgl_unwind_to_host(void);
 
 void initDummyPort() {
 	ClientSocket s;
@@ -4872,7 +4873,7 @@ void PostgresMainLoopOnce() {
 				#ifdef __PGLITE__
 				if (is_pglite_active != 0) {
 				    pgl_setPGliteExitStatus(PGLITE_EXIT_ALIVE);
-				    emscripten_exit_with_live_runtime();
+				    pgl_unwind_to_host();
 			    }
 				else 
 					proc_exit(0);

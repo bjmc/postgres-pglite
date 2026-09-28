@@ -116,3 +116,28 @@ As seen in `pglite/src/pglitec/pglitec.c` we override other `libc` functions for
 Overriding these functions allows us to limit the intervention on the original code and restrict them to a single file.
 
 There are a few changes needed to make PostgreSQL "single-user mode" to behave as a normal backend (see `pgl_startPGlite` inside `postgres-pglite/src/backend/tcop/postgres.c`) or to allow us to handle the faked socket.
+
+## Standalone build
+
+Besides the regular build, which targets JS runtimes, PGlite can be built as a *standalone* WASM module that runs on any WASI runtime (Wasmtime, Wasmer, Node's `node:wasi`, ...) without the emscripten JS glue. This makes PGlite embeddable from other languages, e.g. to use it as a throwaway, in-memory Postgres in Python tests.
+
+```
+BUILD_SCRIPT=./build-pglite-standalone.sh ./build-with-docker.sh
+```
+
+or `pnpm wasm:build:standalone` from the parent repository. This produces `dist/standalone/bin/pglite-standalone.wasm` and `dist/standalone/bin/pglite-standalone-fs.tar.gz`.
+
+The standalone build is an out-of-tree build (in `build/standalone`), and needs a source tree that has not been configured in-tree by `build-pglite.sh`. To have both builds side by side, run the standalone build from a separate checkout, e.g. `git worktree add`.
+
+It uses the same sources, toolchain and configuration as the regular build. The differences are all in how the module talks to its host:
+
+- **Exceptions**: `setjmp`/`longjmp` use native wasm exception handling (`-sSUPPORT_LONGJMP=wasm -sWASM_EXNREF`) instead of JS `invoke_*` trampolines. Runtimes need to support the exception handling proposal with `exnref` (Wasmtime; Node >= 22 with `--experimental-wasm-exnref`).
+- **Returning to the host**: where the regular build calls `emscripten_exit_with_live_runtime()` (see "Exception handling" above), both builds call `pgl_unwind_to_host()`. In the standalone build this `siglongjmp`s back to the jump buffer set by the host entry point that is currently running: `pgl_call_main()`, `pgl_loop_once()` or `pgl_longjmp_recover()`, which wrap `main()`, `PostgresMainLoopOnce()` and `PostgresMainLongJmp()`. These return 1 when they unwound, after which the host checks the exit status with `pgl_setPGliteExitStatus()`, exactly like the JS frontend does after catching the unwind exception.
+- **Data exchange**: the read/write callbacks are the wasm imports `pglite.read` and `pglite.write`, instead of JS functions set with `pgl_set_rw_cbs()`.
+- **Filesystem**: WASMFS, entirely in memory. The host populates it before starting Postgres, with `pgl_fs_mkdir()` and `pgl_fs_write_file()`: the runtime filesystem from `pglite-standalone-fs.tar.gz` (`share/`, ICU data, ...) and an initialized PGDATA.
+- **No dynamic loading**: the module is not a `MAIN_MODULE`, so extensions (including `plpgsql`) cannot be loaded yet.
+- **No signals**: `setitimer()` is a no-op, so timeouts such as `statement_timeout` do not fire. Name resolution only handles numeric addresses. There is no `/dev/shm`, so hosts should pass `-c dynamic_shared_memory_type=sysv`.
+
+All standalone-specific code is in `pglite/src/pglitec/pglitec_standalone.c`, guarded by `PGLITE_STANDALONE`.
+
+The module imports only `wasi_snapshot_preview1` functions, `pglite.read`, `pglite.write` and `env.emscripten_notify_memory_growth` (which can be a no-op). See `packages/pglite-standalone` in the parent repository for a reference host and the host protocol.
