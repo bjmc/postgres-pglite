@@ -37,6 +37,8 @@
 
 #include <emscripten/emscripten.h>
 
+#include "pglitec_standalone.h"
+
 /* ========== Returning control to the host ==========
 *
 * Some code paths (top level longjmp, Terminate message) need to abandon the
@@ -243,6 +245,51 @@ int EMSCRIPTEN_KEEPALIVE pgl_fs_load_tar(const char *prefix, const char *tar, si
         if (rc != 0)
             return rc;
     }
+    return 0;
+}
+
+/* ========== Extensions ==========
+*
+* There is no dynamic loading: extensions are linked into the module (see
+* pglitec_standalone.h), and dlopen() finds them by file name. The file must
+* still exist, as dfmgr.c checks that first.
+*/
+
+/* the default for programs without extensions (initdb) */
+__attribute__((weak)) const pgl_static_library pgl_static_libraries[] = {{NULL, NULL}};
+
+/* libc's dlerror() reports these */
+extern void __dl_seterr(const char *fmt, ...);
+
+void *dlopen(const char *filename, int flags) {
+    const char *base = strrchr(filename, '/');
+    size_t len;
+
+    base = base ? base + 1 : filename;
+    len = strcspn(base, ".");
+    for (const pgl_static_library *lib = pgl_static_libraries; lib->name; lib++) {
+        if (strlen(lib->name) == len && strncmp(lib->name, base, len) == 0)
+            return (void *) lib;
+    }
+    __dl_seterr("%s: not linked into the standalone module", filename);
+    return NULL;
+}
+
+/* a NULL handle (RTLD_DEFAULT) searches all libraries */
+void *dlsym(void *restrict handle, const char *restrict name) {
+    for (const pgl_static_library *lib = handle ? handle : pgl_static_libraries; lib->name; lib++) {
+        for (const pgl_static_symbol *sym = lib->symbols; sym->name; sym++) {
+            if (strcmp(sym->name, name) == 0)
+                return sym->address;
+        }
+        if (handle)
+            break;
+    }
+    __dl_seterr("undefined symbol: %s", name);
+    return NULL;
+}
+
+int dlclose(void *handle) {
     return 0;
 }
 
