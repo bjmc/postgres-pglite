@@ -20,6 +20,7 @@
 #if defined(PGLITE_STANDALONE)
 
 #include <arpa/inet.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -59,8 +60,9 @@ void pgl_unwind_to_host(void) {
         return 1
 
 extern int main(int argc, char *argv[]);
-extern void PostgresMainLoopOnce(void);
-extern void PostgresMainLongJmp(void);
+/* weak: the frontend programs (initdb) link this file too, without the backend */
+extern void PostgresMainLoopOnce(void) __attribute__((weak));
+extern void PostgresMainLongJmp(void) __attribute__((weak));
 
 /*
 * Host entry points, wrapping the functions the JS frontend calls directly.
@@ -246,6 +248,300 @@ int EMSCRIPTEN_KEEPALIVE pgl_fs_load_tar(const char *prefix, const char *tar, si
             return rc;
     }
     return 0;
+}
+
+/* ========== Filesystem export ==========
+*
+* The counterparts of pgl_fs_load_tar(), for the host to get files out of the
+* module, e.g. an initialized PGDATA. The result is malloc'd and the host
+* frees it. All return 0 on success and -errno on failure.
+*/
+typedef struct {
+    char *data;
+    size_t len;
+    size_t cap;
+} pgl_buf;
+
+static int pgl_buf_reserve(pgl_buf *b, size_t extra) {
+    if (b->len + extra <= b->cap)
+        return 0;
+    size_t cap = b->cap ? b->cap : 65536;
+    while (cap < b->len + extra)
+        cap *= 2;
+    char *data = realloc(b->data, cap);
+    if (data == NULL)
+        return -ENOMEM;
+    b->data = data;
+    b->cap = cap;
+    return 0;
+}
+
+/* append size bytes from fd, plus zero padding to a 512 byte block */
+static int pgl_buf_append_file(pgl_buf *b, int fd, size_t size) {
+    size_t padded = (size + 511) / 512 * 512;
+    size_t done = 0;
+    int rc = pgl_buf_reserve(b, padded);
+    if (rc != 0)
+        return rc;
+    while (done < size) {
+        ssize_t n = read(fd, b->data + b->len + done, size - done);
+        if (n < 0)
+            return -errno;
+        if (n == 0)
+            return -EIO;    /* the file shrank */
+        done += n;
+    }
+    memset(b->data + b->len + size, 0, padded - size);
+    b->len += padded;
+    return 0;
+}
+
+static int pgl_tar_header(pgl_buf *b, const char *name, char type, int mode, size_t size) {
+    size_t name_len = strlen(name);
+    unsigned int sum = 0;
+    char *h;
+    int rc;
+
+    if (name_len > 100) {
+        /* GNU long name: the name is the data of a preceding 'L' entry */
+        rc = pgl_tar_header(b, "././@LongLink", 'L', 0, name_len + 1);
+        if (rc != 0 || (rc = pgl_buf_reserve(b, (name_len + 1 + 511) / 512 * 512)) != 0)
+            return rc;
+        memset(b->data + b->len, 0, (name_len + 1 + 511) / 512 * 512);
+        memcpy(b->data + b->len, name, name_len);
+        b->len += (name_len + 1 + 511) / 512 * 512;
+    }
+    rc = pgl_buf_reserve(b, 512);
+    if (rc != 0)
+        return rc;
+    h = b->data + b->len;
+    memset(h, 0, 512);
+    memcpy(h, name, name_len > 100 ? 100 : name_len);
+    snprintf(h + 100, 8, "%07o", mode & 07777);
+    snprintf(h + 108, 8, "%07o", 0);            /* uid */
+    snprintf(h + 116, 8, "%07o", 0);            /* gid */
+    snprintf(h + 124, 12, "%011zo", size);
+    snprintf(h + 136, 12, "%011o", 0);          /* mtime */
+    memset(h + 148, ' ', 8);                    /* checksum, counted as spaces */
+    h[156] = type;
+    memcpy(h + 257, "ustar", 6);
+    memcpy(h + 263, "00", 2);
+    for (int i = 0; i < 512; i++)
+        sum += (unsigned char) h[i];
+    snprintf(h + 148, 7, "%06o", sum);
+    h[155] = ' ';
+    b->len += 512;
+    return 0;
+}
+
+/* add the contents of directory path to the archive, named rel + entry name */
+static int pgl_tar_add_dir(pgl_buf *b, const char *path, const char *rel) {
+    char child[PATH_MAX];
+    char child_rel[PATH_MAX];
+    struct dirent *de;
+    struct stat st;
+    int rc = 0;
+    DIR *dir = opendir(path);
+
+    if (dir == NULL)
+        return -errno;
+    while (rc == 0 && (de = readdir(dir)) != NULL) {
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+            continue;
+        if (snprintf(child, sizeof(child), "%s/%s", path, de->d_name) >= (int) sizeof(child) ||
+            snprintf(child_rel, sizeof(child_rel), "%s%s", rel, de->d_name) >= (int) sizeof(child_rel) - 1) {
+            rc = -ENAMETOOLONG;
+            break;
+        }
+        if (lstat(child, &st) != 0) {
+            rc = -errno;
+            break;
+        }
+        if (S_ISDIR(st.st_mode)) {
+            strcat(child_rel, "/");
+            rc = pgl_tar_header(b, child_rel, '5', st.st_mode, 0);
+            if (rc == 0)
+                rc = pgl_tar_add_dir(b, child, child_rel);
+        } else if (S_ISREG(st.st_mode)) {
+            int fd = open(child, O_RDONLY);
+            if (fd < 0) {
+                rc = -errno;
+                break;
+            }
+            rc = pgl_tar_header(b, child_rel, '0', st.st_mode, st.st_size);
+            if (rc == 0)
+                rc = pgl_buf_append_file(b, fd, st.st_size);
+            close(fd);
+        }
+        /* other file types (symlinks, devices) are skipped */
+    }
+    closedir(dir);
+    return rc;
+}
+
+/*
+* Pack the contents of directory path into an (uncompressed) tarball, with
+* names relative to path. pgl_fs_load_tar(path, ...) restores it.
+*/
+int EMSCRIPTEN_KEEPALIVE pgl_fs_dump_tar(const char *path, char **tar, size_t *len) {
+    pgl_buf b = {0};
+    int rc = pgl_tar_add_dir(&b, path, "");
+
+    if (rc == 0 && (rc = pgl_buf_reserve(&b, 1024)) == 0) {
+        memset(b.data + b.len, 0, 1024);        /* end of archive */
+        b.len += 1024;
+    }
+    if (rc != 0) {
+        free(b.data);
+        return rc;
+    }
+    *tar = b.data;
+    *len = b.len;
+    return 0;
+}
+
+int EMSCRIPTEN_KEEPALIVE pgl_fs_read_file(const char *path, char **data, size_t *len) {
+    pgl_buf b = {0};
+    struct stat st;
+    int rc;
+    int fd = open(path, O_RDONLY);
+
+    if (fd < 0)
+        return -errno;
+    if (fstat(fd, &st) != 0) {
+        rc = -errno;
+    } else {
+        rc = pgl_buf_append_file(&b, fd, st.st_size);
+    }
+    close(fd);
+    if (rc != 0) {
+        free(b.data);
+        return rc;
+    }
+    *data = b.data;
+    *len = st.st_size;
+    return 0;
+}
+
+/* like rm -rf: a path that does not exist is not an error */
+int EMSCRIPTEN_KEEPALIVE pgl_fs_remove_tree(const char *path) {
+    char child[PATH_MAX];
+    struct dirent *de;
+    struct stat st;
+    int rc = 0;
+    DIR *dir;
+
+    if (lstat(path, &st) != 0)
+        return errno == ENOENT ? 0 : -errno;
+    if (!S_ISDIR(st.st_mode))
+        return unlink(path) == 0 ? 0 : -errno;
+    dir = opendir(path);
+    if (dir == NULL)
+        return -errno;
+    while (rc == 0 && (de = readdir(dir)) != NULL) {
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+            continue;
+        if (snprintf(child, sizeof(child), "%s/%s", path, de->d_name) >= (int) sizeof(child))
+            rc = -ENAMETOOLONG;
+        else
+            rc = pgl_fs_remove_tree(child);
+    }
+    closedir(dir);
+    if (rc == 0 && rmdir(path) != 0)
+        rc = -errno;
+    return rc;
+}
+
+/* ========== Subprocesses ==========
+*
+* initdb runs postgres as a subprocess, with system() and popen(). As in the
+* regular build (see initdb.ts in the parent repository), the host runs it in
+* a separate instance of the postgres module, and a pipe is a file.
+*
+* The host import pglite.exec(command, stdin_path, stdout_path) runs command
+* with its stdin and stdout redirected from and to files in this instance's
+* filesystem (each may be NULL), keeping PGDATA in sync between the two
+* instances, and returns its exit code, or -1 if it cannot run the command.
+*/
+PGL_HOST_IMPORT(exec) extern int pgl_host_exec(const char *command, const char *stdin_path, const char *stdout_path);
+
+#define PGL_PIPE_TO_CHILD "/tmp/pglite-pipe-to-child"
+#define PGL_PIPE_FROM_CHILD "/tmp/pglite-pipe-from-child"
+
+static FILE *pgl_pipe = NULL;
+static char *pgl_pipe_command = NULL;   /* popen(..., "w"): runs at pclose() */
+static int pgl_pipe_exit_code = 0;      /* popen(..., "r"): has run already */
+
+/* exit code to wait status; a command that cannot run exits with 127, like in a shell */
+static int pgl_wait_status(int exit_code) {
+    return (exit_code < 0 ? 127 : exit_code & 0xff) << 8;
+}
+
+static ssize_t pgl_host_system(const char *command) {
+    return pgl_wait_status(pgl_host_exec(command, NULL, NULL));
+}
+
+static FILE *pgl_host_popen(const char *command, const char *mode) {
+    if (pgl_pipe != NULL) {
+        errno = EMFILE;     /* one pipe at a time */
+        return NULL;
+    }
+    if (mode[0] == 'r') {
+        pgl_pipe_exit_code = pgl_host_exec(command, NULL, PGL_PIPE_FROM_CHILD);
+        if (pgl_pipe_exit_code < 0) {
+            errno = ENOENT;
+            return NULL;
+        }
+        pgl_pipe = fopen(PGL_PIPE_FROM_CHILD, "r");
+    } else if (mode[0] == 'w') {
+        pgl_pipe_command = strdup(command);
+        if (pgl_pipe_command == NULL)
+            return NULL;
+        pgl_pipe = fopen(PGL_PIPE_TO_CHILD, "w");
+        if (pgl_pipe == NULL) {
+            free(pgl_pipe_command);
+            pgl_pipe_command = NULL;
+        }
+    } else {
+        errno = EINVAL;
+        return NULL;
+    }
+    return pgl_pipe;
+}
+
+static int pgl_host_pclose(FILE *stream) {
+    int exit_code;
+
+    if (stream == NULL || stream != pgl_pipe) {
+        errno = ECHILD;
+        return -1;
+    }
+    fclose(stream);
+    pgl_pipe = NULL;
+    if (pgl_pipe_command != NULL) {
+        exit_code = pgl_host_exec(pgl_pipe_command, PGL_PIPE_TO_CHILD, NULL);
+        free(pgl_pipe_command);
+        pgl_pipe_command = NULL;
+        unlink(PGL_PIPE_TO_CHILD);
+    } else {
+        exit_code = pgl_pipe_exit_code;
+        unlink(PGL_PIPE_FROM_CHILD);
+    }
+    return pgl_wait_status(exit_code);
+}
+
+typedef ssize_t (*pgl_system_t)(const char *command);
+typedef FILE *(*pgl_popen_t)(const char *command, const char *mode);
+typedef int (*pgl_pclose_t)(FILE *stream);
+extern void pgl_set_system_fn(pgl_system_t system_fn);
+extern void pgl_set_popen_fn(pgl_popen_t popen_fn);
+extern void pgl_set_pclose_fn(pgl_pclose_t pclose_fn);
+
+__attribute__((constructor))
+static void pgl_standalone_init_subprocesses(void) {
+    pgl_set_system_fn(pgl_host_system);
+    pgl_set_popen_fn(pgl_host_popen);
+    pgl_set_pclose_fn(pgl_host_pclose);
 }
 
 /* ========== Extensions ==========

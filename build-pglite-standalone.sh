@@ -62,7 +62,7 @@ PGLITE_CFLAGS="$PGLITE_CFLAGS \
 echo "pglite: PGLITE_CFLAGS=$PGLITE_CFLAGS"
 
 PGLITE_LDFLAGS="-sWASM_BIGINT -sUSE_PTHREADS=0 -sSUPPORT_LONGJMP=wasm -sWASM_EXNREF=1"
-# `make` still builds the frontend programs (initdb, psql, ...); they are not used by the standalone module
+# `make` still builds the frontend programs (initdb, psql, ...) for the JS runtime; only initdb is relinked (step 3.1)
 PGLITE_LDFLAGS_EX="-sERROR_ON_UNDEFINED_SYMBOLS=0 -sALLOW_MEMORY_GROWTH $BUILD_DIR/pglitec.o $BUILD_DIR/pglitec_standalone.o"
 
 CONFIGURE_PARAMS="\
@@ -100,7 +100,7 @@ emmake make PORTNAME=emscripten -j || { echo 'error: emmake make PORTNAME=emscri
 emmake make PORTNAME=emscripten install || { echo 'error: emmake make PORTNAME=emscripten install' ; exit 23; }
 
 # Step 2.1: extensions, as "name:directory". There is no dynamic loading, so they
-# are linked into the module (see pglitec_standalone.h).
+# are linked into the module (see pglitec_standalone.h). initdb needs these two.
 STATIC_LIBRARIES="dict_snowball:src/backend/snowball plpgsql:src/pl/plpgsql/src"
 LLVM_NM="$(dirname "$(command -v emcc)")/../bin/llvm-nm"
 STATIC_OBJS=""
@@ -176,6 +176,17 @@ rm -f src/backend/pglite.wasm
 POSTGRES_PGLITE_FLAGS="$PGLITE_CFLAGS $STANDALONE_LDFLAGS $STATIC_OBJS $BUILD_DIR/pgl_static_libraries.o" \
     emmake make PORTNAME=emscripten -C src/backend/ pglite X=.wasm LDFLAGS_EX_BE= || { echo 'error: emmake make PORTNAME=emscripten -C src/backend/ pglite' ; exit 31; }
 
+# Step 3.1: link initdb as a standalone module too, for hosts to create PGDATA.
+# It runs postgres through the host (see "Subprocesses" in pglitec_standalone.c)
+INITDB_LDFLAGS="\
+-sSTANDALONE_WASM=1 --no-entry \
+-sWASMFS=1 \
+-sALLOW_MEMORY_GROWTH \
+-sERROR_ON_UNDEFINED_SYMBOLS=1 \
+-sEXPORTED_FUNCTIONS=_malloc,_free \
+$BUILD_DIR/pglitec.o $BUILD_DIR/pglitec_standalone.o"
+emmake make PORTNAME=emscripten -C src/bin/initdb initdb X=-standalone.wasm LDFLAGS_EX="$INITDB_LDFLAGS" || { echo 'error: emmake make PORTNAME=emscripten -C src/bin/initdb initdb' ; exit 32; }
+
 # Step 4: the runtime filesystem (share/ data, ICU, static files), which the
 # host unpacks into the module's in-memory filesystem before startup
 FS_STAGING="$BUILD_DIR/fs-staging"
@@ -198,5 +209,6 @@ cp -r "$SRC_DIR/pglite/static/minimal-icu/76.1" "$FS_STAGING/pglite/icu"
 
 mkdir -p "$INSTALL_FOLDER/bin"
 cp src/backend/pglite.wasm "$INSTALL_FOLDER/bin/pglite-standalone.wasm"
+cp src/bin/initdb/initdb-standalone.wasm "$INSTALL_FOLDER/bin/initdb-standalone.wasm"
 tar -C "$FS_STAGING" -czf "$INSTALL_FOLDER/bin/pglite-standalone-fs.tar.gz" .
-echo "pglite: built $INSTALL_FOLDER/bin/pglite-standalone.wasm and $INSTALL_FOLDER/bin/pglite-standalone-fs.tar.gz"
+echo "pglite: built pglite-standalone.wasm, initdb-standalone.wasm and pglite-standalone-fs.tar.gz in $INSTALL_FOLDER/bin"

@@ -125,7 +125,11 @@ Besides the regular build, which targets JS runtimes, PGlite can be built as a *
 BUILD_SCRIPT=./build-pglite-standalone.sh ./build-with-docker.sh
 ```
 
-or `pnpm wasm:build:standalone` from the parent repository. This produces `dist/standalone/bin/pglite-standalone.wasm` and `dist/standalone/bin/pglite-standalone-fs.tar.gz`.
+or `pnpm wasm:build:standalone` from the parent repository. This produces, in `dist/standalone/bin/`:
+
+- `pglite-standalone.wasm`: Postgres
+- `initdb-standalone.wasm`: `initdb`, for hosts to create PGDATA (see below)
+- `pglite-standalone-fs.tar.gz`: the runtime filesystem (`share/`, ICU data, ...)
 
 The standalone build is an out-of-tree build (in `build/standalone`), and needs a source tree that has not been configured in-tree by `build-pglite.sh`. To have both builds side by side, run the standalone build from a separate checkout, e.g. `git worktree add`.
 
@@ -135,9 +139,13 @@ It uses the same sources, toolchain and configuration as the regular build. The 
 - **Returning to the host**: where the regular build calls `emscripten_exit_with_live_runtime()` (see "Exception handling" above), both builds call `pgl_unwind_to_host()`. In the standalone build this `siglongjmp`s back to the jump buffer set by the host entry point that is currently running: `pgl_call_main()`, `pgl_loop_once()` or `pgl_longjmp_recover()`, which wrap `main()`, `PostgresMainLoopOnce()` and `PostgresMainLongJmp()`. These return 1 when they unwound, after which the host checks the exit status with `pgl_setPGliteExitStatus()`, exactly like the JS frontend does after catching the unwind exception.
 - **Data exchange**: the read/write callbacks are the wasm imports `pglite.read` and `pglite.write`, instead of JS functions set with `pgl_set_rw_cbs()`.
 - **Filesystem**: WASMFS, entirely in memory. The host populates it before starting Postgres, typically with `pgl_fs_load_tar()`: the runtime filesystem from `pglite-standalone-fs.tar.gz` (`share/`, ICU data, ...) and an initialized PGDATA.
-- **No dynamic loading**: the module is not a `MAIN_MODULE`. Instead, extensions are linked into it: `STATIC_LIBRARIES` in the build script lists them (for now `plpgsql` and `dict_snowball`). They are recompiled with `Pg_magic_func` and `_PG_init` renamed, so that they can coexist, and the script generates a table of the symbols `dfmgr.c` looks up, which the module's `dlopen()` and `dlsym()` use (see `pglitec_standalone.h`). The runtime filesystem has an empty placeholder for each library file, as `dfmgr.c` checks that it exists.
+- **No dynamic loading**: the module is not a `MAIN_MODULE`. Instead, extensions are linked into it: `STATIC_LIBRARIES` in the build script lists them (for now `plpgsql` and `dict_snowball`, which `initdb` needs). They are recompiled with `Pg_magic_func` and `_PG_init` renamed, so that they can coexist, and the script generates a table of the symbols `dfmgr.c` looks up, which the module's `dlopen()` and `dlsym()` use (see `pglitec_standalone.h`). The runtime filesystem has an empty placeholder for each library file, as `dfmgr.c` checks that it exists.
 - **No signals**: `setitimer()` is a no-op, so timeouts such as `statement_timeout` do not fire. Name resolution only handles numeric addresses. There is no `/dev/shm`, so hosts should pass `-c dynamic_shared_memory_type=sysv`.
 
 All standalone-specific code is in `pglite/src/pglitec/pglitec_standalone.[ch]`, guarded by `PGLITE_STANDALONE`.
 
-The module imports only `wasi_snapshot_preview1` functions, `pglite.read`, `pglite.write` and `env.emscripten_notify_memory_growth` (which can be a no-op). See `packages/pglite-standalone` in the parent repository for a reference host and the host protocol.
+The modules import only `wasi_snapshot_preview1` functions, `pglite.read`, `pglite.write`, `pglite.exec` and `env.emscripten_notify_memory_growth` (which can be a no-op). See `packages/pglite-standalone` in the parent repository for a reference host and the host protocol.
+
+### Creating PGDATA
+
+`initdb` runs `postgres` as a subprocess, with `system()` and `popen()`. In the standalone build these call the host import `pglite.exec(command, stdin_path, stdout_path)`, which runs `command` with its stdin and stdout redirected from and to files in the calling instance's filesystem (either may be `NULL`), and returns its exit code, or -1 if it cannot run the command. Like the JS frontend does in `initdb.ts`, the host runs each `postgres` command in a fresh instance of the postgres module, with stdin and stdout redirected to files with `pgl_freopen()`. As each instance has its own in-memory filesystem, the host copies PGDATA into the postgres instance before running it, and back afterwards, with `pgl_fs_dump_tar()`, `pgl_fs_remove_tree()` and `pgl_fs_load_tar()`. Postgres itself only runs `locale -a` (for `pg_import_system_collations()`), which hosts answer with the contents of `/pglite/locale-a`, like the JS frontend does; hosts can refuse other commands.
