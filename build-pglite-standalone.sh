@@ -99,9 +99,10 @@ fi
 emmake make PORTNAME=emscripten -j || { echo 'error: emmake make PORTNAME=emscripten -j' ; exit 21; }
 emmake make PORTNAME=emscripten install || { echo 'error: emmake make PORTNAME=emscripten install' ; exit 23; }
 
-# Step 2.1: extensions, as "name:directory". There is no dynamic loading, so they
-# are linked into the module (see pglitec_standalone.h). initdb needs these two.
-STATIC_LIBRARIES="dict_snowball:src/backend/snowball plpgsql:src/pl/plpgsql/src"
+# Step 2.1: extensions with a library, as "name:directory". There is no dynamic
+# loading, so they are linked into the module (see pglitec_standalone.h).
+# initdb needs dict_snowball and plpgsql.
+STATIC_LIBRARIES="dict_snowball:src/backend/snowball plpgsql:src/pl/plpgsql/src ltree:contrib/ltree btree_gist:contrib/btree_gist"
 LLVM_NM="$(dirname "$(command -v emcc)")/../bin/llvm-nm"
 STATIC_OBJS=""
 STATIC_TABLE="$BUILD_DIR/pgl_static_libraries.c"
@@ -120,11 +121,14 @@ for entry in $STATIC_LIBRARIES; do
     emmake make PORTNAME=emscripten -C "$dir" CFLAGS_SL= \
         COPT="-DPg_magic_func=pgl_${name}_Pg_magic_func -D_PG_init=pgl_${name}__PG_init" \
         || { echo "error: emmake make PORTNAME=emscripten -C $dir" ; exit 25; }
+    # the control and SQL files, for contrib modules
+    emmake make PORTNAME=emscripten -C "$dir" install || { echo "error: emmake make PORTNAME=emscripten -C $dir install" ; exit 25; }
     objs=$(find "$BUILD_DIR/$dir" -name '*.o' | sort | tr '\n' ' ')
     STATIC_OBJS="$STATIC_OBJS $objs"
     funcs=$("$LLVM_NM" --defined-only --extern-only $objs | awk '$2 == "T" {print $3}' | sort -u)
-    # what dfmgr.c looks up: the module magic, _PG_init, and the V1 functions (those with pg_finfo_*)
-    v1_funcs=$(echo "$funcs" | sed -n 's/^pg_finfo_//p')
+    # what dfmgr.c looks up: the module magic, _PG_init, and the V1 functions (those
+    # with pg_finfo_*; some modules declare info for functions they don't define)
+    v1_funcs=$(echo "$funcs" | sed -n 's/^pg_finfo_//p' | grep -Fxf <(echo "$funcs") || true)
     {
         echo "extern const Pg_magic_struct *pgl_${name}_Pg_magic_func(void);"
         if echo "$funcs" | grep -qx "pgl_${name}__PG_init"; then
@@ -151,6 +155,28 @@ done
 printf "const pgl_static_library pgl_static_libraries[] = {\n${STATIC_ENTRIES}    {NULL, NULL}\n};\n" >> "$STATIC_TABLE"
 emcc $PGLITE_CFLAGS -I"$BUILD_DIR/src/include" -I"$SRC_DIR/src/include" -I"$SRC_DIR/pglite/src/pglitec" \
     -c "$STATIC_TABLE" -o "$BUILD_DIR/pgl_static_libraries.o" || { echo 'error: compiling the extension table' ; exit 26; }
+
+# Step 2.2: extensions without a library (SQL only), from pglite/other_extensions.
+# Built from a copy, so the source tree stays clean, against this build tree
+# rather than PGXS. Their makefiles only ask pg_config for the version.
+SQL_EXTENSIONS="pgtap"
+PG_VERSION=$(sed -n 's/^#define PG_VERSION "\(.*\)"$/\1/p' src/include/pg_config.h)
+printf '#!/bin/sh\necho "PostgreSQL %s"\n' "$PG_VERSION" > "$BUILD_DIR/pg_config-version"
+chmod +x "$BUILD_DIR/pg_config-version"
+for name in $SQL_EXTENSIONS; do
+    src="$SRC_DIR/pglite/other_extensions/$name"
+    if [ ! -f "$src/Makefile" ]; then
+        echo "error: $src is missing: git submodule update --init pglite/other_extensions/$name"
+        exit 27
+    fi
+    rm -rf "$BUILD_DIR/other_extensions/$name"
+    mkdir -p "$BUILD_DIR/other_extensions"
+    cp -r "$src" "$BUILD_DIR/other_extensions/$name"
+    emmake make PORTNAME=emscripten -C "$BUILD_DIR/other_extensions/$name" \
+        NO_PGXS=1 NO_GENERATED_HEADERS=1 top_builddir="$BUILD_DIR" srcdir="$BUILD_DIR/other_extensions/$name" \
+        PG_CONFIG="$BUILD_DIR/pg_config-version" install \
+        || { echo "error: building $name" ; exit 27; }
+done
 
 # Step 3: link the standalone module
 # Functions the host calls, in addition to the EMSCRIPTEN_KEEPALIVE ones in pglitec*.c
